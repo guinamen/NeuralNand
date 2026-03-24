@@ -11,16 +11,9 @@
 NeuralNand is a **differentiable neural architecture for synthesizing
 digital circuits directly from truth tables** using **only NAND gates**.
 
-The network is trained using gradient descent and then **collapsed into
-a hardware‑synthesizable Verilog netlist**, preserving a **1:1 mapping
+The network is trained with gradient descent and then **collapsed into a
+hardware‑synthesizable Verilog netlist**, preserving a **1:1 mapping
 between neurons and NAND gates**.
-
-This project explores the intersection of:
-
--   Differentiable Logic Networks
--   Neural Architecture Search
--   Digital Logic Synthesis
--   Neuro‑symbolic computing
 
 ------------------------------------------------------------------------
 
@@ -39,13 +32,24 @@ The network learns logic structure during training and eventually
 ``` mermaid
 flowchart LR
 
-A[Arithmetic Operator] --> B[Truth Table Generator]
-B --> C[Training Dataset]
-C --> D[NAND Neural Network]
-D --> E[Annealing + Gradient Training]
-E --> F[Crisp Circuit Collapse]
-F --> G[Verilog Netlist]
-G --> H[Digital Circuit]
+A["Arithmetic Operator"]
+B["Truth Table Generator"]
+C["Dataset (X,Y)"]
+D["NAND Neural Network"]
+E["Gradient Training"]
+F["Annealing"]
+G["Circuit Collapse"]
+H["Verilog Netlist"]
+I["Digital Circuit"]
+
+A --> B
+B --> C
+C --> D
+D --> E
+E --> F
+F --> G
+G --> H
+H --> I
 ```
 
 ------------------------------------------------------------------------
@@ -65,6 +69,11 @@ Where
 
 As **T → ∞**, the neuron becomes an exact NAND gate.
 
+Design constraints:
+
+-   Bias fixed at −1.5
+-   Weights constrained positive using softplus
+
 ------------------------------------------------------------------------
 
 # Network Structure
@@ -72,17 +81,13 @@ As **T → ∞**, the neuron becomes an exact NAND gate.
 ``` mermaid
 graph TD
 
-I1(Input bits)
-I2(Input bits)
-
-L1[Layer 1 NANDs]
-L2[Layer 2 NANDs]
-L3[Layer 3 NANDs]
-
-O[Output bits]
+I1["Input Bits"]
+L1["Layer 1 NANDs"]
+L2["Layer 2 NANDs"]
+L3["Layer 3 NANDs"]
+O["Output Bits"]
 
 I1 --> L1
-I2 --> L1
 L1 --> L2
 L2 --> L3
 L3 --> O
@@ -105,9 +110,12 @@ discrete gates.
 ``` mermaid
 graph LR
 
-A[Soft Logic] --> B[Structure Formation]
-B --> C[Hard Logic]
-C --> D[Discrete Circuit]
+A["Soft Logic"]
+B["Structure Formation"]
+C["Hard Logic"]
+D["Discrete Circuit"]
+
+A --> B --> C --> D
 ```
 
 A single scalar **γ** controls:
@@ -129,7 +137,7 @@ Components:
 
 ### Weighted BCE
 
-Bit‑level accuracy with MSB emphasis.
+Bit-level accuracy with MSB emphasis.
 
 ### Arithmetic Loss
 
@@ -156,9 +164,7 @@ Instead of datasets, the system generates **complete truth tables**.
   max        2n       n
   min        2n       n
 
-Example: 4‑bit addition
-
-2\^(2n) = 256 training rows.
+Example: 4-bit addition produces **256 rows**.
 
 ------------------------------------------------------------------------
 
@@ -167,13 +173,14 @@ Example: 4‑bit addition
 ``` mermaid
 flowchart TD
 
-A[generate(op,n)]
-B[dataset X,Y]
-C[NANDNet]
-D[trainer]
-E[annealing]
-F[circuit collapse]
-G[verilog]
+A["Operator (op, n)"]
+B["Truth Table Generator"]
+C["Dataset (X,Y)"]
+D["NANDNet Architecture"]
+E["Trainer"]
+F["Annealing Schedule γ"]
+G["Crisp Circuit Collapse"]
+H["Verilog Netlist"]
 
 A --> B
 B --> C
@@ -181,6 +188,7 @@ C --> D
 D --> E
 E --> F
 F --> G
+G --> H
 ```
 
 ------------------------------------------------------------------------
@@ -198,7 +206,7 @@ model = train(
 model.export_verilog("adder4.v")
 ```
 
-Generated circuit example:
+Example generated gate:
 
 ``` verilog
 nand g0 (w0, a0, b0);
@@ -216,23 +224,65 @@ discovery mechanism**.
 Instead of designing circuits manually, the network **learns Boolean
 structure from data**.
 
-Research questions include:
+Key research questions:
 
--   Can NAND‑only networks learn arbitrary Boolean functions?
+-   Can NAND-only networks learn arbitrary Boolean functions?
 -   How optimal are the resulting circuits?
 -   Can approximate circuits emerge naturally?
 -   How does circuit complexity scale with bit width?
 
 ------------------------------------------------------------------------
 
-# Key Differences From Standard Neural Networks
+# Related Work
 
-  Property           NeuralNand         Standard NN
-  ------------------ ------------------ --------------------
-  Activation         NAND relaxation    ReLU / sigmoid
-  Output             Boolean circuit    Numeric prediction
-  Interpretability   Fully structural   Limited
-  Deployment         Verilog hardware   CPU/GPU inference
+  Feature            NeuralNand          Differentiable Logic Gate Networks
+  ------------------ ------------------- ------------------------------------
+  Gate set           NAND only           Multiple gates
+  Hardware mapping   Direct              Requires synthesis
+  Training target    Circuit synthesis   Classification
+  Output             Verilog circuit     Logical inference
+
+------------------------------------------------------------------------
+
+# References
+
+### Differentiable Logic Networks
+
+Petersen, F. et al. (2022)\
+Deep Differentiable Logic Gate Networks\
+NeurIPS 2022\
+https://arxiv.org/abs/2210.08277
+
+Petersen, F. et al. (2024)\
+Convolutional Differentiable Logic Gate Networks\
+https://arxiv.org
+
+------------------------------------------------------------------------
+
+### Discretization Gap
+
+Yousefi, A. et al. (2025)\
+Mind the Gap: Removing the Discretization Gap in Differentiable Logic
+Gate Networks\
+https://arxiv.org/abs/2506.07500
+
+------------------------------------------------------------------------
+
+### Straight‑Through Estimators
+
+Kim, T. (2025)\
+Align Forward, Adapt Backward\
+https://arxiv.org/abs/2603.14157
+
+------------------------------------------------------------------------
+
+### Logic Synthesis of Neural Networks
+
+Chi, Y. & Jiang, J.\
+Logic Synthesis of Binarized Neural Networks
+
+Murovic, T. & Trost, A. (2019)\
+Massively Parallel Combinational Binarized Neural Networks
 
 ------------------------------------------------------------------------
 
@@ -253,7 +303,7 @@ Planned improvements:
 -   Hard Straight‑Through training
 -   Gumbel routing
 -   Automatic circuit simplification
--   Hardware cost optimization
+-   Hardware‑aware training
 -   FPGA benchmarking
 
 ------------------------------------------------------------------------
@@ -262,10 +312,10 @@ Planned improvements:
 
 NeuralNand explores a broader concept:
 
-> Neural networks can function as **program synthesizers** that generate
-> symbolic computational artifacts.
+> Neural networks can function as **program synthesizers that generate
+> symbolic computational artifacts**.
 
-In this project, the artifact is a **digital circuit**.
+In this case, the artifact is a **digital circuit**.
 
 ------------------------------------------------------------------------
 
