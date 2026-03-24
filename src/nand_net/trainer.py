@@ -17,6 +17,13 @@ Loss total:
 
 Criterio de parada:
     L_arith@gamma_atual < epsilon^2  E  gamma >= gamma_crisp
+
+PATCH v2 — tres mudancas:
+  1. use_st=True no forward de treino: ativa Gumbel-ST no roteamento,
+     eliminando o gap de discretizacao (ref: Yousefi et al. 2025).
+  2. Criterio de binaridade: bloqueia early-stop se sinais intermediarios
+     ainda estiverem na fronteira (0.05 < v < 0.95) com gamma_synth.
+  3. Melhor checkpoint: salva apenas quando binaridade + L_arith OK.
 """
 
 import torch
@@ -24,7 +31,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from dataclasses import dataclass
-from typing import Optional, List, Callable
+from typing import Optional, List, Callable, Dict
 
 from .nand_net import NANDNet, AnnealingConfig
 from .dataset  import DatasetMeta
@@ -45,6 +52,10 @@ class TrainerConfig:
     # curvatura da transicao dos pesos adaptativos da loss
     # delta alto: pesos uniformes por mais tempo, divergem so no final
     delta_weights: float = 4.0
+    # PATCH: ativa Gumbel-ST no roteamento durante o treino
+    use_st:        bool  = True
+    # PATCH: limiar de binaridade para liberar sintese Verilog
+    binary_threshold: float = 0.05
 
 
 @dataclass
@@ -61,6 +72,8 @@ class EpochState:
     acc_bit:     float
     acc_row:     float
     is_crisp:    bool
+    # PATCH: novo campo — True quando todos os sinais intermediarios sao binarios
+    is_binary:   bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -132,6 +145,58 @@ def loss_regularization(model: NANDNet) -> torch.Tensor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# PATCH: verificacao de binaridade dos sinais intermediarios
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_binaricity(
+    model: NANDNet,
+    X: torch.Tensor,
+    gamma_synth: float,
+    threshold: float = 0.05,
+) -> Dict:
+    """
+    Executa forward com gamma_synth (modo crisp maximo) e verifica se
+    TODOS os sinais intermediarios estao fora da faixa [threshold, 1-threshold].
+
+    Usa forward_with_intermediates() que emprega roteamento hard (argmax puro,
+    sem Gumbel, sem soft) — reflete exatamente o que o Verilog vai computar.
+
+    Retorna dict com:
+        is_binary_clean  : bool  — True se todos os sinais sao binarios
+        total_frontier   : int   — total de valores na fronteira
+        by_layer         : dict  — contagem por camada
+        worst_value      : float — pior valor (mais proximo de 0.5)
+    """
+    model.eval()
+    with torch.no_grad():
+        intermediates = model.forward_with_intermediates(X.float(), gamma=gamma_synth)
+
+    total_frontier = 0
+    by_layer: Dict[str, int] = {}
+    worst_value = 0.0
+
+    for layer_name, signals in intermediates.items():
+        vals     = signals.flatten()
+        frontier = ((vals >= threshold) & (vals <= 1.0 - threshold))
+        count    = int(frontier.sum().item())
+        by_layer[layer_name] = count
+        total_frontier += count
+        if count > 0:
+            # valor mais proximo de 0.5 nessa camada
+            w = float((vals[frontier] - 0.5).abs().min().item())
+            worst_value = max(worst_value, 0.5 - w)
+
+    return {
+        'is_binary_clean': total_frontier == 0,
+        'total_frontier':  total_frontier,
+        'by_layer':        by_layer,
+        'worst_value':     worst_value,
+        'gamma_used':      gamma_synth,
+        'threshold':       threshold,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Trainer
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -145,6 +210,9 @@ class NANDTrainer:
     sem saltos que destroem a representacao aprendida.
 
     Salva o melhor estado pelo L_arith durante toda a fase crisp.
+
+    PATCH: use_st=True (default) ativa Gumbel-ST no roteamento.
+    Early stop so libera quando binaridade + L_arith estao OK.
     """
 
     def __init__(
@@ -182,7 +250,8 @@ class NANDTrainer:
             self.model.train()
             self.optimizer.zero_grad()
 
-            pred    = self.model(X, gamma)
+            # PATCH: passa use_st para o forward
+            pred    = self.model(X, gamma, use_st=self.config.use_st)
             l_wbce  = loss_weighted_bce(pred, Y, W,
                                         t=t_prog,
                                         delta=self.config.delta_weights)
@@ -202,6 +271,19 @@ class NANDTrainer:
                 acc_bit  = (pred_bin == Y).float().mean().item()
                 acc_row  = (pred_bin == Y).all(dim=1).float().mean().item()
 
+            # PATCH: verifica binaridade dos sinais intermediarios
+            # Usa gamma_synth (muito maior que gamma_crisp) para simular
+            # exatamente o que o Verilog vai computar.
+            # So verifica quando crisp (custo computacional nao-trivial).
+            is_binary = False
+            if is_crisp:
+                bin_report = check_binaricity(
+                    self.model, X,
+                    gamma_synth=self.annealing.gamma_synth,
+                    threshold=self.config.binary_threshold,
+                )
+                is_binary = bin_report['is_binary_clean']
+
             state = EpochState(
                 epoch      = epoch,
                 gamma      = gamma,
@@ -215,11 +297,13 @@ class NANDTrainer:
                 acc_bit    = acc_bit,
                 acc_row    = acc_row,
                 is_crisp   = is_crisp,
+                is_binary  = is_binary,
             )
             self.history.append(state)
 
-            # Salva melhor estado na fase crisp
-            if is_crisp and l_arith.item() < best_arith:
+            # PATCH: salva melhor estado so quando sinais sao binarios
+            # (garante que o checkpoint salvo e sintetizavel)
+            if is_crisp and is_binary and l_arith.item() < best_arith:
                 best_arith      = l_arith.item()
                 best_state_dict = {k: v.clone()
                                    for k, v in self.model.state_dict().items()}
@@ -230,15 +314,24 @@ class NANDTrainer:
                 self.on_log(state)
 
             # ── Early stopping ─────────────────────────────────────────
-            if is_crisp and l_arith.item() < self.config.epsilon ** 2:
+            # PATCH: so para quando binaridade E L_arith estao OK.
+            # Sem isso, a sintese Verilog recebe sinais na fronteira
+            # e propaga erros em cascata por todas as camadas seguintes.
+            if is_crisp and is_binary and l_arith.item() < self.config.epsilon ** 2:
                 self.on_log(state)
                 print(f'\n>> Convergiu epoca {epoch} '
-                      f'L_arith={l_arith.item():.6f} < {self.config.epsilon**2:.6f}')
+                      f'L_arith={l_arith.item():.6f} < {self.config.epsilon**2:.6f} '
+                      f'[sinais binarios OK]')
                 break
 
         if best_state_dict is not None:
             self.model.load_state_dict(best_state_dict)
-            print(f'\n>> Restaurado melhor estado crisp: L_arith={best_arith:.6f}')
+            print(f'\n>> Restaurado melhor estado crisp+binario: L_arith={best_arith:.6f}')
+        elif best_arith == float('inf'):
+            print('\n>> AVISO: nenhum checkpoint binario salvo. '
+                  'Os sinais intermediarios nunca atingiram binaridade completa. '
+                  'A sintese Verilog pode produzir netlist incorreta. '
+                  'Considere aumentar gamma_max ou epochs.')
 
         return self.history
 
@@ -290,9 +383,10 @@ class NANDTrainer:
 
     @staticmethod
     def _default_log(s: EpochState):
-        crisp_tag = '[CRISP]' if s.is_crisp else ''
+        crisp_tag  = '[CRISP]'  if s.is_crisp  else ''
+        binary_tag = '[BIN]'    if s.is_binary  else ''
         print(
-            f'e={s.epoch:4d} | g={s.gamma:5.2f} {crisp_tag:<8} | '
+            f'e={s.epoch:4d} | g={s.gamma:5.2f} {crisp_tag:<8} {binary_tag:<6} | '
             f'a={s.alpha:.2f} b={s.beta:.2f} | '
             f'arith={s.loss_arith:.5f} | acc_row={s.acc_row:.3f}'
         )

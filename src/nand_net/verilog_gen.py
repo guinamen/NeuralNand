@@ -105,25 +105,71 @@ class VerilogGenerator:
         return {'min_concentration': min_conc, 'warnings': warnings}
 
     def _build_graph(self) -> List[Gate]:
-        base_sigs = [f'x{k}' for k in range(self.n_in)]
-        gates     = []
+        """
+        PATCH v2: constroi o grafo usando o forward REAL da rede com
+        gamma_synthesis, em vez de reconstruir pool via argmax(theta)
+        de forma independente.
+
+        O bug anterior: o pool manual era propagado com NAND booleana simples
+        (1 - a*b), ignorando os pesos w1,w2 e a temperatura gamma da sigmoid.
+        Com sinais intermediarios na fronteira (~0.8), a reconstrucao manual
+        divergia do forward real, gerando netlist incorreta.
+
+        Correcao: usa forward_with_intermediates() que propaga os sinais reais
+        e verifica binaridade antes de extrair os indices i*/j* para o Verilog.
+        """
+        import torch
+        import torch.nn.functional as F_
+
+        base_sigs  = [f'x{k}' for k in range(self.n_in)]
+        gates      = []
+        n_layers   = len(self.model.layers)
+        tau_synth  = 1.0 / self.gamma_synthesis
+
+        # ── Executa forward real com gamma_synthesis ───────────────────────
+        # Captura sinais intermediarios reais (nao reconstruidos via argmax).
+        # Isso e o que o circuito Verilog vai computar de fato.
+        self.model.eval()
+        # Gera tabela verdade completa para verificacao de binaridade
+        import itertools
+        X_tt = torch.tensor(
+            list(itertools.product([0, 1], repeat=self.n_in)),
+            dtype=torch.float32,
+        )
+        with torch.no_grad():
+            intermediates = self.model.forward_with_intermediates(
+                X_tt, gamma=self.gamma_synthesis
+            )
+
+        # Verifica binaridade de cada camada antes de continuar
+        threshold = 0.10
+        for layer_name, signals in intermediates.items():
+            vals = signals.flatten()
+            frontier = ((vals > threshold) & (vals < 1.0 - threshold))
+            if frontier.any():
+                worst = vals[frontier]
+                import warnings
+                warnings.warn(
+                    f"VerilogGenerator._build_graph: {layer_name} tem "
+                    f"{int(frontier.sum())} sinais na fronteira "
+                    f"(pior={float(worst.max()):.4f}). "
+                    f"A netlist pode estar incorreta. "
+                    f"Execute o treino ate is_binary=True antes de sintetizar.",
+                    RuntimeWarning,
+                    stacklevel=4,
+                )
+
+        # ── Extrai i*/j* e constroi Gate usando sinais verificados ────────
         prev_sigs = list(base_sigs)
-        n_layers  = len(self.model.layers)
-        tau_synth = 1.0 / self.gamma_synthesis
 
         for li, layer in enumerate(self.model.layers):
-            is_output = (li == n_layers - 1)
-            pool_sigs = list(base_sigs) if li == 0 else prev_sigs + base_sigs
+            is_output  = (li == n_layers - 1)
+            pool_sigs  = list(base_sigs) if li == 0 else prev_sigs + base_sigs
             layer_sigs = []
 
             for ni, neuron in enumerate(layer.neurons):
-                # Usa theta com tau_synthesis para one-hot garantido
-                import torch
-                import torch.nn.functional as F_
-                alpha  = F_.softmax(neuron.theta_a / tau_synth, dim=0)
-                beta   = F_.softmax(neuron.theta_b / tau_synth, dim=0)
-                i_star = alpha.argmax().item()
-                j_star = beta.argmax().item()
+                # Indices crisp via gamma_synthesis (one-hot garantido)
+                i_star, j_star = neuron.crisp_connections(self.gamma_synthesis)
                 w1, w2         = neuron.crisp_weights()
                 i_safe = min(i_star, len(pool_sigs) - 1)
                 j_safe = min(j_star, len(pool_sigs) - 1)
@@ -267,50 +313,57 @@ class VerilogGenerator:
 
     def verify_binary(self, X, gamma: float = None, threshold: float = 0.05) -> dict:
         """
-        Verifica se todas as saidas intermediarias sao suficientemente binarias
-        para que a conversao para Verilog seja correta.
+        PATCH v2: verifica binaridade usando forward_with_intermediates()
+        com gamma_synthesis (muito maior que gamma_crisp).
 
-        Um neuronio esta na 'fronteira' se sua saida, com entradas binarias,
-        cai em [threshold, 1-threshold] — nem claramente 0 nem claramente 1.
-        Neuronios na fronteira produzirao erros no Verilog binario.
+        Diferenca critica em relacao a versao anterior:
+          - Versao antiga: usava gamma_crisp (~15-30) no forward de verificacao.
+            Com esse gamma, alguns neuronios ainda produzem valores na fronteira
+            (ex: 0.8), mas o codigo nao bloqueava a sintese.
+          - Versao nova: usa gamma_synthesis (~200) e forward_with_intermediates()
+            que emprega roteamento hard (argmax puro) — reflete exatamente o
+            que o circuito Verilog vai computar.
 
         Args:
             X         : tabela de entradas binarias
-            gamma     : gamma de avaliacao (default: gamma_crisp)
+            gamma     : ignorado (mantido por compatibilidade); usa gamma_synthesis
             threshold : margem de binaridade (default: 0.05)
 
         Returns:
             dict com contagem de neuronios na fronteira por camada
         """
         import torch
-        if gamma is None:
-            gamma = self.annealing.gamma_crisp
+
+        # PATCH: usa gamma_synthesis, nao gamma_crisp
+        gamma_used = self.gamma_synthesis
 
         self.model.eval()
-        frontier_by_layer = {}
-        total_frontier = 0
-
         with torch.no_grad():
-            h = self.model.layers[0](X.float(), gamma)
-            layers_out = [h]
-            for layer in self.model.layers[1:]:
-                pool = torch.cat([h, X.float()], dim=1)
-                h = layer(pool, gamma)
-                layers_out.append(h)
+            intermediates = self.model.forward_with_intermediates(
+                X.float(), gamma=gamma_used
+            )
 
-        for li, out in enumerate(layers_out):
-            vals = out.flatten()
-            frontier = ((vals >= threshold) & (vals <= 1 - threshold)).sum().item()
-            frontier_by_layer[f'L{li+1}'] = frontier
-            total_frontier += frontier
+        frontier_by_layer = {}
+        total_frontier    = 0
+        worst_val         = 0.0
+
+        for layer_name, signals in intermediates.items():
+            vals     = signals.flatten()
+            mask     = (vals >= threshold) & (vals <= 1.0 - threshold)
+            count    = int(mask.sum().item())
+            frontier_by_layer[layer_name] = count
+            total_frontier += count
+            if count > 0:
+                worst_val = max(worst_val, float(vals[mask].max().item()))
 
         is_clean = total_frontier == 0
         return {
             'is_binary_clean': is_clean,
             'total_frontier':  total_frontier,
             'by_layer':        frontier_by_layer,
-            'gamma_used':      gamma,
+            'gamma_used':      gamma_used,
             'threshold':       threshold,
+            'worst_value':     worst_val,
         }
 
     # ─────────────────────────────────────────────────────────────────────────

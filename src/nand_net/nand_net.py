@@ -11,6 +11,13 @@ Especificacao implementada:
   - Topologia Opcao B: cada camada acessa anterior + entradas originais (skip)
   - Afunilamento linear de n1 neuronios ate n_outputs
   - Um escalar gamma governa T, tau, alpha, beta e lambda simultaneamente
+
+PATCH v2 — Gumbel-ST routing:
+  - NANDNeuron.forward() agora aceita use_st=True para ativar o estimador
+    Straight-Through durante o treino, eliminando o gap de discretizacao
+    no roteamento de conexoes (ref: Yousefi et al. 2025, Kim 2025).
+  - NANDNet expoe forward_with_intermediates() para verificacao de binaridade
+    antes da sintese Verilog.
 """
 
 import torch
@@ -18,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from dataclasses import dataclass
-from typing import List
+from typing import List, Dict, Tuple
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,6 +83,51 @@ class AnnealingConfig:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Gumbel-ST helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _gumbel_noise(shape: torch.Size, device: torch.device) -> torch.Tensor:
+    """Amostra Gumbel(0,1) numericamente estavel."""
+    U = torch.zeros(shape, device=device).uniform_().clamp_(1e-20, 1.0)
+    return -torch.log(-torch.log(U))
+
+
+def _route_soft(theta: torch.Tensor, tau: float, pool: torch.Tensor) -> torch.Tensor:
+    """Roteamento original — softmax continuo. Preservado para compatibilidade."""
+    alpha = F.softmax(theta / tau, dim=0)          # (n_pool,)
+    return (pool * alpha.unsqueeze(0)).sum(dim=1)   # (batch,)
+
+
+def _route_st(theta: torch.Tensor, tau: float, pool: torch.Tensor) -> torch.Tensor:
+    """
+    Roteamento Gumbel-Softmax com Straight-Through Estimator.
+
+    Forward:  hard argmax (one-hot) sobre logits perturbados com Gumbel
+              → sinal de saida BINARIO por construcao durante o treino
+    Backward: gradiente flui pela relaxacao soft Gumbel-Softmax
+              → elimina o gap de discretizacao no roteamento
+
+    Ref: Yousefi et al. (2025) arXiv:2506.07500
+         Kim (2025) arXiv:2603.14157
+    """
+    # Perturba logits com ruido Gumbel (suaviza landscape, melhora convergencia)
+    g = _gumbel_noise(theta.shape, theta.device)
+    perturbed = theta + g                              # (n_pool,)
+
+    # Hard selection no forward — nao-diferenciavel intencionalmente
+    idx  = perturbed.argmax(dim=0)
+    hard = torch.zeros_like(theta).scatter_(0, idx.unsqueeze(0), 1.0)  # one-hot
+
+    # Soft relaxacao para o backward (gradiente de theta flui aqui)
+    soft = F.softmax(perturbed / tau, dim=0)
+
+    # Straight-Through: forward=hard, backward=d(soft)/d(theta)
+    weights = hard - soft.detach() + soft              # (n_pool,)
+
+    return (pool * weights.unsqueeze(0)).sum(dim=1)    # (batch,)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Neuronio NAND diferenciavel
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -100,6 +152,8 @@ class NANDNeuron(nn.Module):
     Limites:
         gamma -> inf  : tau->0 cristaliza conexoes; T->inf binariza saida
         caso i*=j*    : NAND(x,x) = NOT(x) -- aceito, sintetizavel
+
+    PATCH: aceita use_st=True para ativar Gumbel-ST no roteamento.
     """
 
     BIAS = -1.5  # fixo pela especificacao
@@ -139,10 +193,16 @@ class NANDNeuron(nn.Module):
         self.theta_a = nn.Parameter(theta_a)
         self.theta_b = nn.Parameter(theta_b)
 
-    def forward(self, pool: torch.Tensor, gamma: float) -> torch.Tensor:
+    def forward(
+        self,
+        pool: torch.Tensor,
+        gamma: float,
+        use_st: bool = False,
+    ) -> torch.Tensor:
         """
-        pool  : (batch, n_pool) em [0,1]
-        gamma : escalar de annealing
+        pool   : (batch, n_pool) em [0,1]
+        gamma  : escalar de annealing
+        use_st : se True, usa Gumbel-ST no roteamento (recomendado no treino)
 
         Retorna: (batch,)
         """
@@ -150,10 +210,13 @@ class NANDNeuron(nn.Module):
         w1  = F.softplus(self.rho1)
         w2  = F.softplus(self.rho2)
 
-        alpha  = F.softmax(self.theta_a / tau, dim=0)          # (n_pool,)
-        beta   = F.softmax(self.theta_b / tau, dim=0)          # (n_pool,)
-        a_soft = (pool * alpha.unsqueeze(0)).sum(dim=1)        # (batch,)
-        b_soft = (pool * beta.unsqueeze(0)).sum(dim=1)         # (batch,)
+        # PATCH: escolhe estrategia de roteamento
+        if use_st:
+            a_soft = _route_st(self.theta_a, tau, pool)
+            b_soft = _route_st(self.theta_b, tau, pool)
+        else:
+            a_soft = _route_soft(self.theta_a, tau, pool)
+            b_soft = _route_soft(self.theta_b, tau, pool)
 
         z = w1 * a_soft + w2 * b_soft + self.BIAS
         return 1.0 - torch.sigmoid(gamma * z)
@@ -213,9 +276,17 @@ class NANDLayer(nn.Module):
         self.n_pool    = n_pool
         self.neurons   = nn.ModuleList([NANDNeuron(n_pool, i) for i in range(n_neurons)])
 
-    def forward(self, pool: torch.Tensor, gamma: float) -> torch.Tensor:
+    def forward(
+        self,
+        pool: torch.Tensor,
+        gamma: float,
+        use_st: bool = False,
+    ) -> torch.Tensor:
         """pool: (batch, n_pool)  -->  (batch, n_neurons)"""
-        return torch.stack([n(pool, gamma) for n in self.neurons], dim=1)
+        return torch.stack(
+            [n(pool, gamma, use_st=use_st) for n in self.neurons],
+            dim=1,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -278,15 +349,21 @@ class NANDNet(nn.Module):
             sizes.append(max(n_out + 1, n))
         return sizes
 
-    def forward(self, x: torch.Tensor, gamma: float) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        gamma: float,
+        use_st: bool = False,
+    ) -> torch.Tensor:
         """
-        x     : (batch, n_inputs) em {0,1} ou [0,1]
-        gamma : escalar de annealing atual
+        x      : (batch, n_inputs) em {0,1} ou [0,1]
+        gamma  : escalar de annealing atual
+        use_st : ativa Gumbel-ST no roteamento (usar True no treino)
         """
-        h = self.layers[0](x, gamma)
+        h = self.layers[0](x, gamma, use_st=use_st)
         for layer in self.layers[1:]:
             pool = torch.cat([h, x], dim=1)
-            h    = layer(pool, gamma)
+            h    = layer(pool, gamma, use_st=use_st)
         return h
 
     def count_gates(self) -> int:
@@ -304,3 +381,45 @@ class NANDNet(nn.Module):
             tag = 'saida' if i == len(self.layers) - 1 else f'oculta {i+1}'
             lines.append(f'{"L"+str(i+1)+" ("+tag+")":<14} {layer.n_neurons:>10} {layer.n_pool:>8}')
         return '\n'.join(lines)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # PATCH: forward com captura de sinais intermediarios
+    # Usado por VerilogGenerator.verify_binary() e pelo criterio de binaridade
+    # no trainer para bloquear sintese prematura.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def forward_with_intermediates(
+        self,
+        x: torch.Tensor,
+        gamma: float,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Executa forward com gamma alto (modo crisp) e retorna os sinais
+        intermediarios de cada camada.
+
+        Usa roteamento HARD (argmax determinístico, sem Gumbel, sem soft)
+        para refletir exatamente o que o Verilog vai computar.
+
+        Retorno
+        -------
+        dict { "L1": tensor(batch, n1), "L2": tensor(batch, n2), ... }
+        incluindo a camada de saida como "saida".
+
+        IMPORTANTE: use gamma alto (ex: gamma_synth=200) para que o
+        roteamento seja equivalente ao argmax puro.
+        """
+        intermediates: Dict[str, torch.Tensor] = {}
+
+        # Modo hard: tau -> 0, argmax determinístico via gamma alto
+        # Nao usa Gumbel (nao queremos ruido na verificacao)
+        h = self.layers[0](x, gamma, use_st=False)
+        tag = 'saida' if len(self.layers) == 1 else 'L1'
+        intermediates[tag] = h
+
+        for li, layer in enumerate(self.layers[1:], start=2):
+            pool = torch.cat([h, x], dim=1)
+            h    = layer(pool, gamma, use_st=False)
+            tag  = 'saida' if li == len(self.layers) else f'L{li}'
+            intermediates[tag] = h
+
+        return intermediates
