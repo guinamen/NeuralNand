@@ -255,7 +255,7 @@ https://arxiv.org/abs/2210.08277
 
 Petersen, F. et al. (2024)\
 Convolutional Differentiable Logic Gate Networks\
-https://arxiv.org
+https://arxiv.org/abs/2411.04732
 
 ------------------------------------------------------------------------
 
@@ -280,9 +280,11 @@ https://arxiv.org/abs/2603.14157
 
 Chi, Y. & Jiang, J.\
 Logic Synthesis of Binarized Neural Networks
+https://dlnext.acm.org/doi/10.1145/3240765.3240822
 
 Murovic, T. & Trost, A. (2019)\
 Massively Parallel Combinational Binarized Neural Networks
+https://ev.fe.uni-lj.si/1-2-2019/Murovic.pdf
 
 ------------------------------------------------------------------------
 
